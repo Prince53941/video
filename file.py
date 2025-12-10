@@ -1,114 +1,143 @@
 import streamlit as st
-import os
-from faster_whisper import WhisperModel
-from transformers import pipeline
-import textwrap
+import cv2
+import mediapipe as mp
+import numpy as np
+import screen_brightness_control as sbc
+from math import hypot
+
+# Try importing PyCaw for Volume Control (Windows primarily)
+try:
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    pycaw_available = True
+except ImportError:
+    pycaw_available = False
 
 # --- PAGE CONFIG ---
-st.set_page_config(page_title="Video Summarizer AI", page_icon="🎥", layout="wide")
+st.set_page_config(page_title="Gesture Control AI", page_icon="🖐️", layout="centered")
 
-st.title("🎥 AI Video Summarizer & Subtitler")
+st.title("🖐️ AI Hand Gesture Controller")
 st.markdown("""
-Upload a video file (mp4, mkv, avi). This app will:
-1. **Extract Audio** and transcribe it using **OpenAI Whisper**.
-2. **Generate Subtitles** (transcript).
-3. **Summarize** the content using a HuggingFace model.
+Control your PC using hand gestures! 
+1. **Show your hand** to the camera.
+2. **Pinch** your Thumb and Index finger to adjust levels.
+3. Select **Volume** or **Brightness** mode below.
 """)
 
-# --- 1. MODEL LOADING ---
-@st.cache_resource
-def load_whisper_model():
-    # 'tiny' or 'base' is faster for CPU. Use 'small' or 'medium' for better accuracy if you have a GPU.
-    model = WhisperModel("base", device="cpu", compute_type="int8")
-    return model
+# --- 1. SETUP MEDIAPIPE ---
+mp_hands = mp.solutions.hands
+hands = mp_hands.Hands(
+    static_image_mode=False,
+    max_num_hands=1,
+    min_detection_confidence=0.7,
+    min_tracking_confidence=0.7
+)
+mp_draw = mp.solutions.drawing_utils
 
-@st.cache_resource
-def load_summarizer():
-    # Using a lightweight summarization model suitable for CPUs
-    summarizer = pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-    return summarizer
+# --- 2. SETUP VOLUME CONTROL (PyCaw) ---
+volume = None
+volRange = [0, 0]
+if pycaw_available:
+    try:
+        devices = AudioUtilities.GetSpeakers()
+        interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+        volume = interface.QueryInterface(IAudioEndpointVolume)
+        volRange = volume.GetVolumeRange() # usually (-65.25, 0.0)
+    except:
+        pycaw_available = False
 
-# --- 2. PROCESSING FUNCTIONS ---
-def extract_transcript(video_path, model):
-    segments, info = model.transcribe(video_path, beam_size=5)
+# --- 3. HELPER FUNCTIONS ---
+def get_distance(p1, p2):
+    return hypot(p2[0] - p1[0], p2[1] - p1[1])
+
+# --- 4. STREAMLIT UI LAYOUT ---
+mode = st.radio("Select Control Mode:", ("System Volume", "Screen Brightness"), horizontal=True)
+run = st.checkbox("Start Camera", value=False)
+frame_placeholder = st.empty()
+
+# --- 5. MAIN LOOP ---
+if run:
+    cap = cv2.VideoCapture(0)
     
-    full_text = ""
-    timestamps = []
+    # Check if camera opened
+    if not cap.isOpened():
+        st.error("Could not access the camera.")
     
-    progress_bar = st.progress(0)
-    st.write(f"Detecting language: {info.language} (Probability: {info.language_probability:.2f})")
-    
-    # Iterate through segments (this is a generator)
-    # We can't know total length easily for progress bar, so we just animate it
-    for i, segment in enumerate(segments):
-        full_text += segment.text + " "
-        timestamps.append(f"[{segment.start:.2f}s -> {segment.end:.2f}s] {segment.text}")
+    while run:
+        success, img = cap.read()
+        if not success:
+            st.warning("Camera disconnected.")
+            break
+
+        # Convert image for MediaPipe
+        imgRGB = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        results = hands.process(imgRGB)
         
-        # Update progress bar simply to show activity
-        if i % 10 == 0:
-            progress_bar.progress(min(i % 100, 100))
+        lmList = []
+        if results.multi_hand_landmarks:
+            for hand_landmarks in results.multi_hand_landmarks:
+                mp_draw.draw_landmarks(img, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+                
+                # Get ID and coordinates for landmarks
+                for id, lm in enumerate(hand_landmarks.landmark):
+                    h, w, c = img.shape
+                    cx, cy = int(lm.x * w), int(lm.y * h)
+                    lmList.append([id, cx, cy])
+
+        if len(lmList) != 0:
+            # Tip of Thumb (ID 4) and Index Finger (ID 8)
+            x1, y1 = lmList[4][1], lmList[4][2]
+            x2, y2 = lmList[8][1], lmList[8][2]
             
-    progress_bar.progress(100)
-    return full_text.strip(), timestamps
+            # Midpoint (for visuals)
+            cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
 
-def generate_summary(text, summarizer):
-    # Models have a max token limit (usually 1024). We need to chunk the text.
-    # Simple chunking by characters (approx 3000 chars ~ 700 tokens)
-    chunks = textwrap.wrap(text, 3000)
-    summary_text = ""
-    
-    for chunk in chunks:
-        # Generate summary for each chunk
-        output = summarizer(chunk, max_length=150, min_length=30, do_sample=False)
-        summary_text += output[0]['summary_text'] + " "
-        
-    return summary_text.strip()
+            # Draw points and line
+            cv2.circle(img, (x1, y1), 10, (255, 0, 255), cv2.FILLED)
+            cv2.circle(img, (x2, y2), 10, (255, 0, 255), cv2.FILLED)
+            cv2.line(img, (x1, y1), (x2, y2), (255, 0, 255), 3)
+            cv2.circle(img, (cx, cy), 10, (255, 0, 255), cv2.FILLED)
 
-# --- 3. UI LAYOUT ---
-uploaded_file = st.file_uploader("Upload Video File", type=["mp4", "mov", "avi", "mkv"])
+            # Calculate Distance
+            length = get_distance((x1, y1), (x2, y2))
+            
+            # Hand range: approx 30 (closed) to 250 (open)
+            # Map this range to 0-100 or Volume Range
+            
+            # --- MODE: VOLUME ---
+            if mode == "System Volume":
+                if pycaw_available:
+                    # Map hand range (30-200) to Volume Range (min-max)
+                    vol = np.interp(length, [30, 200], [volRange[0], volRange[1]])
+                    volume.SetMasterVolumeLevel(vol, None)
+                    
+                    # Visual Bar
+                    volBar = np.interp(length, [30, 200], [400, 150])
+                    volPer = np.interp(length, [30, 200], [0, 100])
+                    
+                    cv2.rectangle(img, (50, 150), (85, 400), (0, 255, 0), 3)
+                    cv2.rectangle(img, (50, int(volBar)), (85, 400), (0, 255, 0), cv2.FILLED)
+                    cv2.putText(img, f'{int(volPer)} %', (40, 450), cv2.FONT_HERSHEY_COMPLEX, 1, (0, 255, 0), 3)
+                else:
+                    cv2.putText(img, "PyCaw not installed/supported", (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
 
-if uploaded_file is not None:
-    # Save the file temporarily
-    temp_filename = "temp_video.mp4"
-    with open(temp_filename, "wb") as f:
-        f.write(uploaded_file.read())
-    
-    # Display Video
-    st.video(temp_filename)
-    
-    if st.button("🚀 Process Video"):
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            st.info("Loading AI Models... (This happens only once)")
-            whisper_model = load_whisper_model()
-            summarizer_model = load_summarizer()
-            st.success("Models Loaded!")
-            
-            st.info("Transcribing Audio...")
-            transcript_text, timed_subtitles = extract_transcript(temp_filename, whisper_model)
-            st.success("Transcription Complete!")
-            
-        with col2:
-            st.info("Summarizing Text...")
-            summary = generate_summary(transcript_text, summarizer_model)
-            st.success("Summary Complete!")
-            
-        # --- RESULTS DISPLAY ---
-        st.divider()
-        
-        st.subheader("📝 Summary")
-        st.warning(summary)
-        
-        with st.expander("See Full Transcript"):
-            st.text_area("Full Text", transcript_text, height=200)
-        
-        with st.expander("See Timestamps (Subtitles)"):
-            st.write(timed_subtitles)
-            
-        # Download Buttons
-        st.download_button("Download Transcript", transcript_text, file_name="transcript.txt")
-        st.download_button("Download Summary", summary, file_name="summary.txt")
+            # --- MODE: BRIGHTNESS ---
+            elif mode == "Screen Brightness":
+                # Map hand range (30-200) to Brightness (0-100)
+                bright = np.interp(length, [30, 200], [0, 100])
+                try:
+                    sbc.set_brightness(int(bright))
+                except:
+                    pass # Ignore errors on unsupported displays
+                
+                cv2.rectangle(img, (50, 150), (85, 400), (255, 255, 0), 3)
+                cv2.rectangle(img, (50, int(np.interp(bright, [0, 100], [400, 150]))), (85, 400), (255, 255, 0), cv2.FILLED)
+                cv2.putText(img, f'{int(bright)} %', (40, 450), cv2.FONT_HERSHEY_COMPLEX, 1, (255, 255, 0), 3)
 
-    # Cleanup (Optional)
-    # os.remove(temp_filename)
+        # Update Streamlit Frame
+        # Convert BGR (OpenCV) to RGB (Streamlit)
+        frame_placeholder.image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB), channels="RGB")
+        
+    cap.release()
+else:
+    st.info("Check 'Start Camera' to begin.")
