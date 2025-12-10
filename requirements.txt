@@ -1,5 +1,7 @@
 streamlit
-faster-whisper
-transformers
-torch
-textwrap3
+opencv-python
+mediapipe
+numpy
+screen-brightness-control
+pycaw
+comtypes
